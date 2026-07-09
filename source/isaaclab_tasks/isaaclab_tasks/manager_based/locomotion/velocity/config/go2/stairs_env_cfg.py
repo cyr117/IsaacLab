@@ -205,13 +205,24 @@ class UnitreeGo2StairsEnvCfg(UnitreeGo2RoughEnvCfg):
         # reward each foot for taking real steps (rough default 0.01 was so low the robot
         # dropped a leg to save torque); 0.25 is the shipped Go2-flat value
         self.rewards.feet_air_time.weight = 0.25
+        # penalize walking on knees/shins: any contact on a thigh or calf link (feet are
+        # the only parts that should touch). Re-enables the term Go2-rough disabled, with
+        # Go2 link names. base_contact is already a termination, so it's not included here.
+        self.rewards.undesired_contacts = RewTerm(
+            func=mdp.undesired_contacts,
+            weight=-1.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]),
+                "threshold": 1.0,
+            },
+        )
 
         # --- command: rotate to face +x (into the stairs), then walk straight forward ---
         # spawn yaw is random (reset_base), so the robot must turn to square up; no
         # lateral command keeps it going straight up-over-down.
         self.commands.base_velocity.heading_command = True
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
-        self.commands.base_velocity.ranges.lin_vel_x = (0.3, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.8, 1.5)  # brisk: reward faster climbing
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.rel_standing_envs = 0.0
 
@@ -229,7 +240,7 @@ class UnitreeGo2StairsEnvCfg_PLAY(UnitreeGo2StairsEnvCfg):
 
         # scripted demo: face +x and keep walking forward for the whole episode
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
-        self.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.8)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.2)  # snappy watchable pace
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.resampling_time_range = (100.0, 100.0)
