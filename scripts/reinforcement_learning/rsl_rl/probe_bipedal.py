@@ -43,7 +43,7 @@ def main(env_cfg, agent_cfg):
     contacts = env.unwrapped.scene["contact_forces"]
     front_ids = contacts.find_bodies(["F[LR]_foot"])[0]
     obs = env.get_observations()
-    pitches, heights, front_hits = [], [], []
+    pitches, heights, front_hits, speeds = [], [], [], []
     for i in range(args_cli.steps):
         with torch.inference_mode():
             obs, _, dones, _ = env.step(policy(obs)); policy.reset(dones)
@@ -52,15 +52,24 @@ def main(env_cfg, agent_cfg):
         z = robot.data.root_pos_w[0, 2].item()
         fmag = contacts.data.net_forces_w[0, front_ids].norm(dim=-1).max().item()
         pitches.append(pitch); heights.append(z); front_hits.append(1.0 if fmag > 1.0 else 0.0)
+        speeds.append(robot.data.root_lin_vel_w[0, :2].norm().item())
         if i % 50 == 0:
-            print(f"[B] step {i:3d}  pitch={pitch:6.1f} deg  base_z={z:.3f}  front_contact={fmag > 1.0}")
+            print(
+                f"[B] step {i:3d}  pitch={pitch:6.1f} deg  base_z={z:.3f}  front_contact={fmag > 1.0}"
+                f"  speed_xy={speeds[-1]:.2f}"
+            )
     n = len(pitches) // 2  # stats over the second half (after standing up)
     second = pitches[n:]
     mp = sum(second) / len(second)
     mh = sum(heights[n:]) / len(second)
     fc = sum(front_hits[n:]) / len(second)
-    print(f"[B] DONE (2nd half)  mean_pitch={mp:6.1f} deg  mean_base_z={mh:.3f}  front_contact_frac={fc:.2f}")
+    ms = sum(speeds[n:]) / len(speeds[n:])
+    print(
+        f"[B] DONE (2nd half)  mean_pitch={mp:6.1f} deg  mean_base_z={mh:.3f}  front_contact_frac={fc:.2f}"
+        f"  mean_speed_xy={ms:.2f}"
+    )
     print(f"[B] Interpretation: pitch >= ~75 deg, base_z >= ~0.45, front_contact_frac <= ~0.05 => genuinely bipedal.")
+    print(f"[B] Interpretation: additionally mean_speed_xy near the commanded 0.5 m/s => also tracking velocity.")
     env.close()
 
 
