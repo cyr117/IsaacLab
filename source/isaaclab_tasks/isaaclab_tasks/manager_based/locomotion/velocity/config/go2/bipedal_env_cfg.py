@@ -163,6 +163,27 @@ def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> 
     return (torch.sum(in_contact.int(), dim=1) == 0).float()
 
 
+def rear_feet_fore_aft_split(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="R[LR]_foot"),
+) -> torch.Tensor:
+    """Penalize a fore-aft scissor stance of the rear feet (heading-frame split beyond a stride deadzone).
+
+    Without this, the policy cheats balance with a permanent lunge -- one rear foot far
+    ahead of the body, one far behind -- which is statically stable fore-aft instead of
+    the human-like feet-under-hips posture in the paper. Separation along the heading
+    direction up to ``threshold`` (a normal walking stride) is free; only the sustained
+    wide split is charged.
+    """
+    asset = env.scene[asset_cfg.name]
+    feet_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    diff = feet_xy[:, 0] - feet_xy[:, 1]
+    heading = asset.data.heading_w
+    dx = diff[:, 0] * torch.cos(heading) + diff[:, 1] * torch.sin(heading)
+    return torch.square(torch.clamp(torch.abs(dx) - threshold, min=0.0))
+
+
 class upright_curriculum(ManagerTermBase):
     """Global posture curriculum: ramps the pitch/height targets as the population succeeds.
 
@@ -278,6 +299,12 @@ class BipedalRewardsCfg(RewardsCfg):
         },
     )
     # walking keeps one foot on the ground: penalize flight phases outright
+    # no fencer's-lunge stance: rear feet stay near each other fore-aft, as in the paper
+    rear_feet_split = RewTerm(
+        func=rear_feet_fore_aft_split,
+        weight=-10.0,
+        params={"threshold": 0.15, "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot")},
+    )
     rear_double_air = RewTerm(
         func=rear_feet_double_air,
         weight=-1.0,
