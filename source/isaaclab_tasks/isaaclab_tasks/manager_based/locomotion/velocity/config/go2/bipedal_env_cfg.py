@@ -12,10 +12,14 @@ Reward terms, weights, commands, randomizations, and control parameters are port
 config their published checkpoints were trained with). No curriculum: the paper
 trains directly to the vertical posture with the orientation + pendulum rewards.
 
-Frame convention: the paper tracks commands in the STANDING body frame (forward =
--body_z, yaw = body_x; see their ``_reward_tracking_lin_vel`` override). We use the
-gravity-aligned yaw frame instead -- the identical mapping once the robot is upright,
-but well-defined during the quadruped->bipedal transition too.
+Frame convention: the paper tracks commands in the raw STANDING body frame (linear
+commands vs the negated body (y, z) velocities; yaw vs body-x angular velocity --
+their ``_reward_tracking_lin_vel``/``_ang_vel`` overrides), ported verbatim. This is
+deliberate, not a quirk: in quadruped stance those axes are lateral/VERTICAL, so
+tracking reward is unearnable on four legs -- it only unlocks once the robot stands
+up. That posture gating is the funnel that pulls the policy into the bipedal stance;
+replacing it with gravity-aligned tracking lets a quadruped gait farm the tracking
+reward and training collapses (verified empirically).
 
 Documented deviations from the paper: (1) the policy observes ground-truth base
 velocity and CoM-CoP vector in place of the concurrently-trained estimator network
@@ -66,16 +70,34 @@ class BipedalManagerBasedRLEnv(ManagerBasedRLEnv):
 ##
 
 
-def lin_vel_z_world_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize WORLD-frame vertical velocity (paper r3's v_x^2: bobbing when standing)."""
+def track_lin_vel_standing_frame_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Paper's ``tracking_lin_vel``, verbatim: commands vs NEGATED body-frame (y, z) velocity.
+
+    cmd_x pairs with -vel_body_y (lateral once standing) and cmd_y with -vel_body_z
+    (forward = belly direction once standing). Unearnable in quadruped stance, where
+    body z is vertical -- see the module docstring.
+    """
     asset = env.scene[asset_cfg.name]
-    return torch.square(asset.data.root_lin_vel_w[:, 2])
+    err = torch.sum(
+        torch.square(env.command_manager.get_command(command_name)[:, :2] + asset.data.root_lin_vel_b[:, 1:3]),
+        dim=1,
+    )
+    return torch.exp(-err / std**2)
 
 
-def ang_vel_xy_world_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize WORLD-frame roll/pitch rates (paper r3's ||w_yz||^2: wobble, yaw free)."""
+def track_ang_vel_standing_frame_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Paper's ``tracking_ang_vel``, verbatim: yaw command vs body-x angular velocity.
+
+    Body x is the world-up (yaw) axis once the robot is standing; in quadruped stance
+    it is the roll axis, so yaw tracking too only unlocks when upright.
+    """
     asset = env.scene[asset_cfg.name]
-    return torch.sum(torch.square(asset.data.root_ang_vel_w[:, :2]), dim=1)
+    err = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 0])
+    return torch.exp(-err / std**2)
 
 
 def gravity_xy_sq(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -180,20 +202,21 @@ class ComCopObs(ManagerTermBase):
 class BipedalRewardsCfg(RewardsCfg):
     """TumblerNet's released reward set (their shipped train_cfg_robot.py scales)."""
 
-    # -- r1 tracking: 1.0 / 0.6, sigma^2 = 0.25 (std 0.5), gravity-aligned frame
+    # -- r1 tracking: 1.0 / 0.6, sigma^2 = 0.25 (std 0.5), STANDING body frame (verbatim)
     track_lin_vel_xy_exp = RewTerm(
-        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        func=track_lin_vel_standing_frame_exp,
         weight=1.0,
         params={"command_name": "base_velocity", "std": 0.5},
     )
     track_ang_vel_z_exp = RewTerm(
-        func=mdp.track_ang_vel_z_world_exp,
+        func=track_ang_vel_standing_frame_exp,
         weight=0.6,
         params={"command_name": "base_velocity", "std": 0.5},
     )
-    # -- r3 smoothness: vertical bob and wobble (their lin_vel_z -2.0, ang_vel_xy -0.05)
-    lin_vel_z_l2 = RewTerm(func=lin_vel_z_world_l2, weight=-2.0)
-    ang_vel_xy_l2 = RewTerm(func=ang_vel_xy_world_l2, weight=-0.05)
+    # -- r3 smoothness: body-frame velocity penalties, verbatim (their lin_vel_z -2.0
+    # doubles as a speed cap once standing, since body z is then the forward axis)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     # -- r4 bipedal encouragement: upright trunk + standing height
     orientation_up = RewTerm(func=gravity_xy_sq, weight=0.8)
     orientation_z = RewTerm(func=gravity_z_sq, weight=-0.03)
@@ -291,8 +314,12 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             },
         )
 
-        # --- commands: the base velocity-task defaults ARE the paper's ranges
-        # (lin x/y in [-1, 1], yaw in [-1, 1], heading command mode, resample 10 s) ---
+        # --- commands: paper ranges (lin x/y and yaw all in [-1, 1], resample 10 s are
+        # the base defaults). Direct yaw sampling instead of heading mode: Isaac Lab's
+        # heading error uses the body-x forward axis, which points at the SKY once the
+        # robot stands -- the paper's own heading mode used a bipedal forward axis. ---
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
 
         # --- events: paper domain randomization ---
         self.events.physics_material.params["static_friction_range"] = (0.2, 1.25)
@@ -336,11 +363,11 @@ class UnitreeGo2BipedalEnvCfg_PLAY(UnitreeGo2BipedalEnvCfg):
         self.scene.num_envs = 10
         self.scene.env_spacing = 2.5
 
-        # scripted demo: walk forward at a steady bipedal pace for the whole episode
-        self.commands.base_velocity.heading_command = False
-        self.commands.base_velocity.rel_heading_envs = 0.0
-        self.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        # scripted demo: walk forward at a steady bipedal pace for the whole episode.
+        # NOTE the paper's command mapping: cmd_y tracks -body_z velocity = FORWARD
+        # (belly direction) once standing; cmd_x is (negated) lateral.
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.resampling_time_range = (100.0, 100.0)
