@@ -49,7 +49,9 @@ def _height_target(env: ManagerBasedRLEnv) -> float:
     return getattr(env, "bipedal_height_target", HEIGHT_MAX)
 
 
-def upright_pitch_exp(env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def upright_pitch_exp(
+    env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """Reward matching the base attitude to the current curriculum pitch target.
 
     For a nose-up pitch theta (rotation about body y), gravity expressed in the base
@@ -64,7 +66,9 @@ def upright_pitch_exp(env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntity
     return torch.exp(-err / std)
 
 
-def base_height_exp(env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def base_height_exp(
+    env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """Reward holding the base at the curriculum standing height (stand tall, don't crouch)."""
     asset = env.scene[asset_cfg.name]
     err = torch.square(asset.data.root_pos_w[:, 2] - _height_target(env))
@@ -77,8 +81,9 @@ class upright_curriculum(ManagerTermBase):
     Tracks an EMA of the population's mean absolute pitch error. When the EMA drops
     below ``err_threshold`` the level steps up by ``level_step`` (0 -> 1 overall) and
     the EMA is bumped pessimistically so the next promotion waits for stable
-    performance at the NEW target. The current level is returned so it appears in
-    TensorBoard as ``Curriculum/upright_level``.
+    performance at the NEW target. Returns a dict of ``{"level": ..., "ema_err": ...}``
+    so both appear in TensorBoard, as ``Curriculum/upright_level/level`` and
+    ``Curriculum/upright_level/ema_err``.
     """
 
     def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
@@ -100,7 +105,7 @@ class upright_curriculum(ManagerTermBase):
             self.level = min(1.0, self.level + level_step)
             self.ema_err += 0.2  # hysteresis: re-earn the threshold at the new target
             self._apply(env)
-        return torch.tensor(self.level)
+        return {"level": self.level, "ema_err": self.ema_err}
 
 
 @configclass
@@ -163,7 +168,8 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         self.actions.joint_pos.scale = 0.5
 
         # --- rewards ---
-        self.rewards.track_lin_vel_xy_exp.weight = 1.5  # y commanded 0 -> tracks x, kills drift
+        # track_lin_vel_xy_exp weight (1.5) is inherited from UnitreeGo2RoughEnvCfg unchanged:
+        # since lin_vel_y is always commanded 0, it tracks x while actively killing lateral drift.
         self.rewards.track_ang_vel_z_exp.weight = 1.0
         # vertical/pitching motion is intrinsic to standing up; soften the defaults
         self.rewards.lin_vel_z_l2.weight = -0.5

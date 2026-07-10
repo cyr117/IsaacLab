@@ -55,9 +55,10 @@ def main(env_cfg, agent_cfg):
         if i % 50 == 0:
             print(f"[B] step {i:3d}  pitch={pitch:6.1f} deg  base_z={z:.3f}  front_contact={fmag > 1.0}")
     n = len(pitches) // 2  # stats over the second half (after standing up)
-    mp = sum(pitches[n:]) / n
-    mh = sum(heights[n:]) / n
-    fc = sum(front_hits[n:]) / n
+    second = pitches[n:]
+    mp = sum(second) / len(second)
+    mh = sum(heights[n:]) / len(second)
+    fc = sum(front_hits[n:]) / len(second)
     print(f"[B] DONE (2nd half)  mean_pitch={mp:6.1f} deg  mean_base_z={mh:.3f}  front_contact_frac={fc:.2f}")
     print(f"[B] Interpretation: pitch >= ~75 deg, base_z >= ~0.45, front_contact_frac <= ~0.05 => genuinely bipedal.")
     env.close()
