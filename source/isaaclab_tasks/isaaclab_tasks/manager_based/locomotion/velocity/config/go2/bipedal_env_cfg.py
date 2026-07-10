@@ -107,9 +107,11 @@ def front_feet_force(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torc
 class PendulumReward(ManagerTermBase):
     """TumblerNet's CoM-CoP stability terms (their r5; VHIP + cart-table models).
 
-    Pendulum vector = CoM - CoP in the world frame, where the CoP is the midpoint of
-    the two REAR feet with z = 0 -- exactly as in the authors' reward code (they
-    commented out the force-weighted variant). Modes:
+    Pendulum vector = CoM - CoP in the world frame, with the CoP force-weighted over
+    all four feet (tiny bias on the rear feet keeps it defined in flight). This is
+    the ``pen_vec`` the authors' SHIPPED env computes in its observation pipeline and
+    uses in its reward overrides -- the same vector the policy observes as c-hat, so
+    reward and observation agree exactly as in the paper. Modes:
 
     - ``"angle"``: theta^2, theta = angle of the pendulum vector from vertical
       (their ``inv_pendulum``, weight -0.1)
@@ -122,15 +124,19 @@ class PendulumReward(ManagerTermBase):
     def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         self._asset = env.scene["robot"]
-        self._rear_ids = self._asset.find_bodies(["RL_foot", "RR_foot"], preserve_order=True)[0]
+        self._sensor = env.scene.sensors["contact_forces"]
+        self._feet_ids = self._asset.find_bodies(FEET_ORDER, preserve_order=True)[0]
+        self._sensor_feet_ids = self._sensor.find_bodies(FEET_ORDER, preserve_order=True)[0]
         masses = self._asset.data.default_mass.to(env.device)  # (num_envs, num_bodies)
         self._mass = masses.unsqueeze(-1)
         self._total_mass = masses.sum(dim=1, keepdim=True)
+        self._eps = torch.tensor([0.0, 0.0, 1e-6, 1e-6], device=env.device)
 
     def __call__(self, env, mode: str) -> torch.Tensor:
+        feet_w = self._asset.data.body_pos_w[:, self._feet_ids, :]
+        fz = self._sensor.data.net_forces_w[:, self._sensor_feet_ids, 2].clamp(min=0.0) + self._eps
+        cop = (feet_w * fz.unsqueeze(-1)).sum(dim=1) / fz.sum(dim=1, keepdim=True)
         com = (self._mass * self._asset.data.body_com_pos_w).sum(dim=1) / self._total_mass
-        cop = self._asset.data.body_pos_w[:, self._rear_ids, :].mean(dim=1)
-        cop[:, 2] = 0.0
         pen = com - cop
         length = pen.norm(dim=1).clamp(min=1e-6)
         cos_theta = (pen[:, 2] / length).clamp(-1.0, 1.0)
@@ -275,13 +281,13 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
                 "threshold": 0.5,
             },
         )
-        # paper collision = -1.0 on thigh + calf contacts
+        # paper collision = -1.0 on thigh + calf contacts (their force threshold: 0.1 N)
         self.rewards.undesired_contacts = RewTerm(
             func=mdp.undesired_contacts,
             weight=-1.0,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]),
-                "threshold": 1.0,
+                "threshold": 0.1,
             },
         )
 
@@ -297,9 +303,19 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-                "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+                "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (0.0, 0.0)},
             },
         )
+        # paper reset diversity (the quadruped parent config narrowed both)
+        self.events.reset_robot_joints.params["position_range"] = (0.5, 1.5)
+        self.events.reset_base.params["velocity_range"] = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "z": (-0.5, 0.5),
+            "roll": (-0.5, 0.5),
+            "pitch": (-0.5, 0.5),
+            "yaw": (-0.5, 0.5),
+        }
         self.events.push_robot = EventTerm(
             func=mdp.push_by_setting_velocity,
             mode="interval",
