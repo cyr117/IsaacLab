@@ -104,8 +104,9 @@ class ComOverSupportReward(ManagerTermBase):
 
     Stand-in for TumblerNet's CoM-CoP stability rewards (VHIP pendulum angle and
     cart-table handle length): standing is stable exactly when the CoM projects over
-    the rear-feet support. Uses spawn-default link masses (startup mass randomization
-    shifts them by at most a few percent).
+    the rear-feet support. Uses spawn-default link masses; the startup add_base_mass
+    randomization (up to ~+3 kg on the base) is ignored, which barely moves the
+    HORIZONTAL CoM since the base sits near the geometric center.
     """
 
     def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
@@ -117,9 +118,9 @@ class ComOverSupportReward(ManagerTermBase):
         self._total_mass = masses.sum(dim=1, keepdim=True)
 
     def __call__(self, env, asset_cfg, support_body_names):
-        body_pos = self._asset.data.body_pos_w  # (num_envs, num_bodies, 3)
-        com_xy = (self._mass * body_pos).sum(dim=1)[:, :2] / self._total_mass
-        support_xy = body_pos[:, self._feet_ids, :2].mean(dim=1)
+        body_com = self._asset.data.body_com_pos_w  # per-link CoM positions, (num_envs, num_bodies, 3)
+        com_xy = (self._mass * body_com).sum(dim=1)[:, :2] / self._total_mass
+        support_xy = self._asset.data.body_pos_w[:, self._feet_ids, :2].mean(dim=1)
         return torch.sum(torch.square(com_xy - support_xy), dim=1)
 
 
