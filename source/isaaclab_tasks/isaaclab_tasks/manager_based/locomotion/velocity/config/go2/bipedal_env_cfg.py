@@ -27,6 +27,7 @@ from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
@@ -124,6 +125,44 @@ class ComOverSupportReward(ManagerTermBase):
         return torch.sum(torch.square(com_xy - support_xy), dim=1)
 
 
+class BipedalGaitReward(ManagerTermBase):
+    """Alternating-gait reward for the two rear feet (human-like walking).
+
+    Rewards the rear feet being OUT of phase -- one in stance while the other swings --
+    using the same air/contact-time kernel as the quadruped trot reward in the stairs
+    task. Directly punishes pronking/hopping, where both feet leave and land together.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.std: float = cfg.params["std"]
+        self.max_err: float = cfg.params["max_err"]
+        self.velocity_threshold: float = cfg.params["velocity_threshold"]
+        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self.asset = env.scene[cfg.params["asset_cfg"].name]
+        feet = self.contact_sensor.find_bodies(cfg.params["foot_names"])[0]
+        if len(feet) != 2:
+            raise ValueError(f"Expected exactly two rear feet, got body ids {feet}.")
+        self.foot_0, self.foot_1 = feet
+
+    def __call__(self, env, std, max_err, velocity_threshold, foot_names, asset_cfg, sensor_cfg):
+        at = self.contact_sensor.data.current_air_time
+        ct = self.contact_sensor.data.current_contact_time
+        se_0 = torch.clip(torch.square(at[:, self.foot_0] - ct[:, self.foot_1]), max=self.max_err**2)
+        se_1 = torch.clip(torch.square(ct[:, self.foot_0] - at[:, self.foot_1]), max=self.max_err**2)
+        reward = torch.exp(-(se_0 + se_1) / self.std)
+        cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
+        body_vel = torch.linalg.norm(self.asset.data.root_lin_vel_w[:, :2], dim=1)
+        return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
+
+
+def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Penalize BOTH rear feet being airborne at once (a flight phase = hopping, not walking)."""
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    in_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    return (torch.sum(in_contact.int(), dim=1) == 0).float()
+
+
 class upright_curriculum(ManagerTermBase):
     """Global posture curriculum: ramps the pitch/height targets as the population succeeds.
 
@@ -133,11 +172,14 @@ class upright_curriculum(ManagerTermBase):
     performance at the NEW target. Returns a dict of ``{"level": ..., "ema_err": ...}``
     so both appear in TensorBoard, as ``Curriculum/upright_level/level`` and
     ``Curriculum/upright_level/ema_err``.
+
+    ``init_level`` seeds the level on construction -- pass 1.0 when resuming a run
+    whose curriculum already topped out (the level is not stored in checkpoints).
     """
 
     def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self.level = 0.0
+        self.level = float(cfg.params.get("init_level", 0.0))
         self.ema_err = 1.0  # pessimistic init (rad)
         self._apply(env)
 
@@ -145,7 +187,15 @@ class upright_curriculum(ManagerTermBase):
         env.bipedal_pitch_target = PITCH_MIN + self.level * (PITCH_MAX - PITCH_MIN)
         env.bipedal_height_target = HEIGHT_MIN + self.level * (HEIGHT_MAX - HEIGHT_MIN)
 
-    def __call__(self, env, env_ids, err_threshold: float = 0.15, level_step: float = 0.05, ema_alpha: float = 0.02):
+    def __call__(
+        self,
+        env,
+        env_ids,
+        err_threshold: float = 0.15,
+        level_step: float = 0.05,
+        ema_alpha: float = 0.02,
+        init_level: float = 0.0,
+    ):
         g = env.scene["robot"].data.projected_gravity_b
         pitch = torch.atan2(-g[:, 0], -g[:, 2])  # 0 = flat, pi/2 = vertical
         err = torch.abs(pitch - env.bipedal_pitch_target).mean().item()
@@ -176,7 +226,7 @@ class BipedalRewardsCfg(RewardsCfg):
         params={"command_name": "base_velocity", "std": 0.5},
     )
     # world-frame regularizers (the body-frame defaults punish walking/turning when vertical)
-    lin_vel_z_l2 = RewTerm(func=lin_vel_z_world_l2, weight=-0.5)
+    lin_vel_z_l2 = RewTerm(func=lin_vel_z_world_l2, weight=-1.0)
     ang_vel_xy_l2 = RewTerm(func=ang_vel_xy_world_l2, weight=-0.05)
 
     # the star reward: base attitude at the curriculum pitch target, roll ~ 0
@@ -196,11 +246,42 @@ class BipedalRewardsCfg(RewardsCfg):
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"])},
     )
     # front legs hang in a natural tucked pose (paper ablation: without a pose
-    # regularizer the front legs cross and jitter)
+    # regularizer the front legs cross and jitter). Raised from -0.05: at that weight
+    # the front legs still flailed rapidly in the air while walking.
     joint_deviation_front_legs = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.05,
+        weight=-0.25,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_thigh_joint", "F[LR]_calf_joint"])},
+    )
+    # damp front-leg thrashing directly (deviation alone allowed fast oscillation around
+    # the target pose)
+    front_joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.01,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["F[LR]_hip_joint", "F[LR]_thigh_joint", "F[LR]_calf_joint"]
+            )
+        },
+    )
+    # human-like alternation of the rear feet (kills pronking)
+    gait = RewTerm(
+        func=BipedalGaitReward,
+        weight=1.0,
+        params={
+            "std": 0.1,
+            "max_err": 0.2,
+            "velocity_threshold": 0.3,
+            "foot_names": ["R[LR]_foot"],
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+        },
+    )
+    # walking keeps one foot on the ground: penalize flight phases outright
+    rear_double_air = RewTerm(
+        func=rear_feet_double_air,
+        weight=-1.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
     )
     # keep the CoM over the rear-feet support (TumblerNet's core stability criterion)
     com_over_support = RewTerm(
@@ -225,7 +306,7 @@ class BipedalCurriculumCfg:
 
     upright_level = CurrTerm(
         func=upright_curriculum,
-        params={"err_threshold": 0.15, "level_step": 0.05, "ema_alpha": 0.02},
+        params={"err_threshold": 0.15, "level_step": 0.05, "ema_alpha": 0.02, "init_level": 0.0},
     )
 
 
