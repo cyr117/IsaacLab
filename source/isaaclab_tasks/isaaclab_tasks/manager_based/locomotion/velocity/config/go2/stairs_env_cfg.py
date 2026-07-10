@@ -14,6 +14,7 @@ center-spawn task never did, so it could only handle stairs it was already stand
 
 import numpy as np
 import torch
+import trimesh
 
 import isaaclab.terrains as terrain_gen
 from isaaclab.assets import Articulation
@@ -22,7 +23,7 @@ from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.terrains.trimesh.mesh_terrains import pyramid_stairs_terrain
+from isaaclab.terrains.trimesh.utils import make_border
 from isaaclab.utils import configclass
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
@@ -32,28 +33,71 @@ from .rough_env_cfg import UnitreeGo2RoughEnvCfg
 
 
 ##
-# Traverse terrain: same pyramid-stairs mesh, but spawn origin at the base (-x side,
-# on the flat border, ground level) instead of the top platform. Walking +x then
-# climbs UP one face, crosses the top platform, and descends the far face.
+# Irregular traverse terrain: a pyramid staircase where EACH step has a different
+# (random) height, so the robot must adapt to unpredictable steps instead of a fixed
+# rise. Spawn origin is at the -x base (on the flat border), so walking +x climbs up one
+# irregular face, crosses the top platform, and descends the far face. Overall step size
+# grows with difficulty (curriculum); the per-step randomness adds the "dynamic" variety.
 ##
-def pyramid_stairs_traverse_terrain(difficulty, cfg):
-    meshes, _ = pyramid_stairs_terrain(difficulty, cfg)
-    # spawn on the flat border just before the -x stairs (small run-up to square up)
+def pyramid_stairs_irregular_traverse_terrain(difficulty, cfg):
+    min_h = cfg.step_height_range[0]
+    max_h = cfg.step_height_range[0] + difficulty * (cfg.step_height_range[1] - cfg.step_height_range[0])
+
+    num_steps_x = (cfg.size[0] - 2 * cfg.border_width - cfg.platform_width) // (2 * cfg.step_width) + 1
+    num_steps_y = (cfg.size[1] - 2 * cfg.border_width - cfg.platform_width) // (2 * cfg.step_width) + 1
+    num_steps = max(1, int(min(num_steps_x, num_steps_y)))
+
+    # each step gets its own random height; cumulative sums are the top-surface heights
+    step_h = np.random.uniform(min_h, max_h, size=num_steps)
+    tops = np.cumsum(step_h)
+    bottom_z = -1.0  # boxes extend below the floor so they stay solid
+
+    meshes = []
+    # flat border around the pyramid, top flush with the floor (z = 0)
+    if cfg.border_width > 0.0:
+        inner = (cfg.size[0] - 2 * cfg.border_width, cfg.size[1] - 2 * cfg.border_width)
+        meshes += make_border(cfg.size, inner, 1.0, (0.5 * cfg.size[0], 0.5 * cfg.size[1], -0.5))
+
+    cx, cy = 0.5 * cfg.size[0], 0.5 * cfg.size[1]
+    tx, ty = cfg.size[0] - 2 * cfg.border_width, cfg.size[1] - 2 * cfg.border_width
+    for k in range(num_steps):
+        top = float(tops[k])
+        bz, bh = 0.5 * (top + bottom_z), top - bottom_z
+        off = (k + 0.5) * cfg.step_width
+        sx, sy = tx - 2 * k * cfg.step_width, ty - 2 * k * cfg.step_width
+        # top & bottom edges of the ring
+        for s in (1.0, -1.0):
+            p = (cx, cy + s * (ty / 2.0 - off), bz)
+            meshes.append(trimesh.creation.box((sx, cfg.step_width, bh), trimesh.transformations.translation_matrix(p)))
+        # left & right edges of the ring
+        for s in (1.0, -1.0):
+            p = (cx + s * (tx / 2.0 - off), cy, bz)
+            meshes.append(
+                trimesh.creation.box((cfg.step_width, sy - 2 * cfg.step_width, bh), trimesh.transformations.translation_matrix(p))
+            )
+
+    # central platform at the highest cumulative height
+    top = float(tops[-1])
+    dims = (tx - 2 * num_steps * cfg.step_width, ty - 2 * num_steps * cfg.step_width, top - bottom_z)
+    meshes.append(trimesh.creation.box(dims, trimesh.transformations.translation_matrix((cx, cy, 0.5 * (top + bottom_z)))))
+
+    # traverse spawn origin: on the flat -x border, facing +x into the stairs
     origin = np.array([0.5 * cfg.border_width, 0.5 * cfg.size[1], 0.0])
     return meshes, origin
 
 
 @configclass
 class MeshPyramidStairsTraverseTerrainCfg(terrain_gen.MeshPyramidStairsTerrainCfg):
-    function = pyramid_stairs_traverse_terrain
+    function = pyramid_stairs_irregular_traverse_terrain
 
 
-# training terrain: traverse pyramids across a difficulty curriculum (steps 0.05 -> 0.18 m)
+# training terrain: irregular traverse pyramids; per-step height random in [0.05, max],
+# where max grows with difficulty up to 0.20 m (harder than the uniform 0.18 m task)
 STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
     num_rows=10,  # difficulty levels
-    num_cols=20,  # variations
+    num_cols=20,  # variations (each tile also has its own random step pattern)
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
@@ -62,7 +106,7 @@ STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         "stairs": MeshPyramidStairsTraverseTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.05, 0.18),
+            step_height_range=(0.05, 0.20),
             step_width=0.35,
             platform_width=3.0,
             border_width=1.0,
@@ -71,7 +115,7 @@ STAIRS_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
-# play terrain: a single traverse pyramid at fixed, comfortable step height
+# play terrain: a single irregular traverse pyramid; each step a visibly different height
 PLAY_TRAVERSE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
@@ -82,11 +126,11 @@ PLAY_TRAVERSE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
     slope_threshold=0.75,
     use_cache=False,
     curriculum=False,
-    difficulty_range=(0.5, 0.5),
+    difficulty_range=(0.6, 0.6),
     sub_terrains={
         "stairs": MeshPyramidStairsTraverseTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.10, 0.12),
+            step_height_range=(0.06, 0.18),  # per-step random in [0.06, ~0.13] at difficulty 0.6
             step_width=0.35,
             platform_width=3.0,
             border_width=1.0,
