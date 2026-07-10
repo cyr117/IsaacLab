@@ -41,6 +41,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply_inverse
 
+import isaaclab.utils.math as math_utils
+
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import RewardsCfg
 
@@ -68,6 +70,57 @@ class BipedalManagerBasedRLEnv(ManagerBasedRLEnv):
 # Rewards ported from the paper (gravity/world frame where the paper's standing body
 # frame is used -- identical when upright, singularity-free during the transition).
 ##
+
+
+def reset_to_bipedal_stance(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    probability: float,
+    pitch_range: tuple[float, float],
+    height_range: tuple[float, float],
+    rear_calf_range: tuple[float, float] = (-1.4, -1.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reference-state initialization (RSI): re-reset a fraction of envs near-bipedal.
+
+    NOT in the paper (their episodes always start quadruped) -- an exploration aid
+    only, the reward set stays verbatim. Empirically required for our port: with the
+    ``only_positive_rewards`` clip, every reachable quadruped behavior nets exactly 0
+    reward, so PPO has no gradient toward the (positive) standing region and training
+    collapses before exploration finds it. Seeding ~30% of episodes upright makes the
+    standing value discoverable; the policy still learns the quadruped->bipedal
+    stand-up from the other ~70% of starts.
+
+    Runs after ``reset_base``/``reset_robot_joints`` (event order) and overwrites the
+    chosen subset: root pitched nose-up (random yaw), rear legs rotated to stay
+    world-vertical under the body, near-zero velocities.
+    """
+    mask = torch.rand(len(env_ids), device=env.device) < probability
+    ids = env_ids[mask]
+    if len(ids) == 0:
+        return
+    asset = env.scene[asset_cfg.name]
+    n = len(ids)
+    zeros = torch.zeros(n, device=env.device)
+    pitch = math_utils.sample_uniform(pitch_range[0], pitch_range[1], (n,), env.device)
+    yaw = math_utils.sample_uniform(-3.14, 3.14, (n,), env.device)
+    # nose-up = rotation about y by -pitch (body x-axis ends up pointing skyward)
+    q_pitch = torch.stack([torch.cos(-pitch / 2), zeros, torch.sin(-pitch / 2), zeros], dim=1)
+    q_yaw = torch.stack([torch.cos(yaw / 2), zeros, zeros, torch.sin(yaw / 2)], dim=1)
+    quat = math_utils.quat_mul(q_yaw, q_pitch)
+    pos = env.scene.env_origins[ids].clone()
+    pos[:, 2] += math_utils.sample_uniform(height_range[0], height_range[1], (n,), env.device)
+    asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1), env_ids=ids)
+    asset.write_root_velocity_to_sim(torch.zeros(n, 6, device=env.device), env_ids=ids)
+    # rear legs: rotate thighs back by the body pitch so the legs stay under the body
+    joint_pos = asset.data.default_joint_pos[ids].clone()
+    rear_thigh = asset.find_joints("R[LR]_thigh_joint")[0]
+    rear_calf = asset.find_joints("R[LR]_calf_joint")[0]
+    joint_pos[:, rear_thigh] = (1.0 + pitch).unsqueeze(1)
+    joint_pos[:, rear_calf] = math_utils.sample_uniform(
+        rear_calf_range[0], rear_calf_range[1], (n, len(rear_calf)), env.device
+    )
+    asset.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos), env_ids=ids)
 
 
 def track_lin_vel_standing_frame_exp(
@@ -343,6 +396,18 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             "pitch": (-0.5, 0.5),
             "yaw": (-0.5, 0.5),
         }
+        # RSI exploration aid (see reset_to_bipedal_stance docstring): ~30% of
+        # episodes start near-bipedal so the clipped reward's positive region is
+        # discoverable; runs after the resets above and overwrites its subset
+        self.events.reset_bipedal_stance = EventTerm(
+            func=reset_to_bipedal_stance,
+            mode="reset",
+            params={
+                "probability": 0.3,
+                "pitch_range": (1.2, 1.5),  # ~69-86 deg nose-up
+                "height_range": (0.50, 0.56),
+            },
+        )
         self.events.push_robot = EventTerm(
             func=mdp.push_by_setting_velocity,
             mode="interval",
@@ -372,7 +437,8 @@ class UnitreeGo2BipedalEnvCfg_PLAY(UnitreeGo2BipedalEnvCfg):
         self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.resampling_time_range = (100.0, 100.0)
 
-        # deterministic playback
+        # deterministic playback; start quadruped so the demo shows the stand-up
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+        self.events.reset_bipedal_stance = None
