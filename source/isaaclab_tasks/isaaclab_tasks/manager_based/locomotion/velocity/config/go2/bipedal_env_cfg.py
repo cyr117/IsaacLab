@@ -3,338 +3,234 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Go2 task: stand up on the two REAR legs and walk bipedally on flat ground.
+"""Go2 task: bipedal (rear-legs) walking -- faithful reproduction of TumblerNet.
 
-Approach (reproducing the behavior of TumblerNet, Xiao et al., npj Robotics 2025):
-an upright-posture reward whose target pitch ramps from ~45 deg to ~85 deg via a
-performance-gated global curriculum, a penalty on any non-rear-foot ground contact
-(front feet, thighs, calves -- this also kills the sitting-dog local optimum), a
-raised base-height target, a CoM-over-support stability penalty (stand-in for the
-paper's VHIP/cart-table CoM-CoP rewards), and velocity tracking (forward/backward +
-yaw) in the gravity-aligned frame -- body-frame tracking breaks once the body is
-vertical. Not reproduced from the paper: the concurrent estimator network (sim-only
-policy; ground-truth base velocity is observed directly) and lateral-velocity
-commands (out of scope by design). Every episode starts in the normal quadruped
-stance, so the policy also learns the stand-up maneuver itself.
+Reward terms, weights, commands, randomizations, and control parameters are ported
+1:1 from the authors' released training configuration (Xiao et al., npj Robotics
+2025; github.com/arclab-hku/bipedal_locomotion_for_quadrupedal_robots, files
+``outputs/random_dog/Imi/test_estimator/{train_cfg_robot.py,robot.py}`` -- the exact
+config their published checkpoints were trained with). No curriculum: the paper
+trains directly to the vertical posture with the orientation + pendulum rewards.
+
+Frame convention: the paper tracks commands in the STANDING body frame (forward =
+-body_z, yaw = body_x; see their ``_reward_tracking_lin_vel`` override). We use the
+gravity-aligned yaw frame instead -- the identical mapping once the robot is upright,
+but well-defined during the quadruped->bipedal transition too.
+
+Documented deviations from the paper: (1) the policy observes ground-truth base
+velocity and CoM-CoP vector in place of the concurrently-trained estimator network
+(sim-only work; the estimator exists for real-robot deployment); (2) no
+motor-strength/PD-gain randomization (no such event in this Isaac Lab version;
+sim2real measure); (3) Go2 instead of Go1 (same scale, same default stance).
+The paper's ``only_positive_rewards`` clip (without which early termination pays
+better than balancing) IS reproduced, via :class:`BipedalManagerBasedRLEnv`.
 """
 
-import math
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ManagerTermBase
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply_inverse
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import RewardsCfg
 
 from .rough_env_cfg import UnitreeGo2RoughEnvCfg
 
-##
-# Curriculum target ranges. Level 0 is an easy rear-up; level 1 is near-vertical.
-# Height: base sits ~0.34 m in quadruped stance (spawn 0.4 minus settling); a
-# near-vertical stand on bent rear legs puts the base center around 0.55 m. The
-# exact top value is verified with the Task 2 probe and tuned if needed.
-##
-PITCH_MIN, PITCH_MAX = math.radians(45.0), math.radians(85.0)
-HEIGHT_MIN, HEIGHT_MAX = 0.34, 0.55
+# feet in a fixed order shared by every term below (asset and contact sensor agree)
+FEET_ORDER = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
 
-def _pitch_target(env: ManagerBasedRLEnv) -> float:
-    # play/eval envs have no curriculum -> default to the final (vertical) target
-    return getattr(env, "bipedal_pitch_target", PITCH_MAX)
+class BipedalManagerBasedRLEnv(ManagerBasedRLEnv):
+    """ManagerBasedRLEnv with legged_gym's ``only_positive_rewards`` behavior.
 
-
-def _height_target(env: ManagerBasedRLEnv) -> float:
-    return getattr(env, "bipedal_height_target", HEIGHT_MAX)
-
-
-def upright_pitch_exp(
-    env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """Reward matching the base attitude to the current curriculum pitch target.
-
-    For a nose-up pitch theta (rotation about body y), gravity expressed in the base
-    frame is (-sin(theta), 0, -cos(theta)). Matching the FULL projected-gravity vector
-    drives pitch to the target and roll to zero in one term.
+    The paper clips the summed per-step reward at zero (their base config sets
+    ``only_positive_rewards = True``). Without it, the heavy early penalties make
+    terminating (falling) pay better than learning to balance.
     """
-    asset = env.scene[asset_cfg.name]
-    theta = _pitch_target(env)
-    g = asset.data.projected_gravity_b
-    target = torch.tensor([-math.sin(theta), 0.0, -math.cos(theta)], device=g.device)
-    err = torch.sum(torch.square(g - target), dim=1)
-    return torch.exp(-err / std)
+
+    def step(self, action):
+        obs, rew, terminated, truncated, extras = super().step(action)
+        rew.clamp_(min=0.0)
+        return obs, rew, terminated, truncated, extras
 
 
-def base_height_exp(
-    env: ManagerBasedRLEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """Reward holding the base at the curriculum standing height (stand tall, don't crouch)."""
-    asset = env.scene[asset_cfg.name]
-    err = torch.square(asset.data.root_pos_w[:, 2] - _height_target(env))
-    return torch.exp(-err / std)
+##
+# Rewards ported from the paper (gravity/world frame where the paper's standing body
+# frame is used -- identical when upright, singularity-free during the transition).
+##
 
 
 def lin_vel_z_world_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize WORLD-frame vertical velocity (bobbing).
-
-    The default ``lin_vel_z_l2`` penalizes BODY-frame z velocity, which points
-    backward-horizontal once the robot stands up -- it would punish forward walking.
-    """
+    """Penalize WORLD-frame vertical velocity (paper r3's v_x^2: bobbing when standing)."""
     asset = env.scene[asset_cfg.name]
     return torch.square(asset.data.root_lin_vel_w[:, 2])
 
 
 def ang_vel_xy_world_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Penalize WORLD-frame roll/pitch rates (wobble), leaving commanded yaw free.
-
-    The default ``ang_vel_xy_l2`` is BODY-frame: when the robot is vertical, commanded
-    yaw turning appears as body-x angular velocity and would be punished.
-    """
+    """Penalize WORLD-frame roll/pitch rates (paper r3's ||w_yz||^2: wobble, yaw free)."""
     asset = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.root_ang_vel_w[:, :2]), dim=1)
 
 
-class ComOverSupportReward(ManagerTermBase):
-    """Penalty: horizontal (world-xy) offset of the robot's CoM from the rear-feet midpoint.
+def gravity_xy_sq(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Paper's ``orientation`` term (weight +0.8): g_x^2 + g_y^2 of projected gravity.
 
-    Stand-in for TumblerNet's CoM-CoP stability rewards (VHIP pendulum angle and
-    cart-table handle length): standing is stable exactly when the CoM projects over
-    the rear-feet support. Uses spawn-default link masses; the startup add_base_mass
-    randomization (up to ~+3 kg on the base) is ignored, which barely moves the
-    HORIZONTAL CoM since the base sits near the geometric center.
+    Maximal (1.0) when gravity is perpendicular to the body z-axis, i.e. the trunk is
+    vertical -- this POSITIVE reward is what pulls the robot up onto two legs.
+    """
+    asset = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def gravity_z_sq(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Paper's ``orientation_3`` term (weight -0.03): g_z^2, redundant push to vertical."""
+    asset = env.scene[asset_cfg.name]
+    return torch.square(asset.data.projected_gravity_b[:, 2])
+
+
+def front_feet_force(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Continuous penalty on front-feet contact force magnitude.
+
+    The paper penalizes ||F_FL|| and ||F_FR|| (their fl/fr/f_contact_force terms,
+    -0.03 each -> -0.06 per foot in total) instead of a binary contact flag.
+    """
+    forces = env.scene.sensors[sensor_cfg.name].data.net_forces_w[:, sensor_cfg.body_ids, :]
+    return forces.norm(dim=-1).sum(dim=1)
+
+
+class PendulumReward(ManagerTermBase):
+    """TumblerNet's CoM-CoP stability terms (their r5; VHIP + cart-table models).
+
+    Pendulum vector = CoM - CoP in the world frame, where the CoP is the midpoint of
+    the two REAR feet with z = 0 -- exactly as in the authors' reward code (they
+    commented out the force-weighted variant). Modes:
+
+    - ``"angle"``: theta^2, theta = angle of the pendulum vector from vertical
+      (their ``inv_pendulum``, weight -0.1)
+    - ``"acc"``: (sin(theta)/L)^2 ~ pendulum angular acceleration / g
+      (their ``inv_pendulum_acc``, weight -0.0001)
+    - ``"len_xy"``: ||pen_xy||, the cart-table handle length
+      (their ``cart_table_len_xy``, weight -0.1)
     """
 
     def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._asset = env.scene[cfg.params["asset_cfg"].name]
-        self._feet_ids = self._asset.find_bodies(cfg.params["support_body_names"])[0]
+        self._asset = env.scene["robot"]
+        self._rear_ids = self._asset.find_bodies(["RL_foot", "RR_foot"], preserve_order=True)[0]
         masses = self._asset.data.default_mass.to(env.device)  # (num_envs, num_bodies)
         self._mass = masses.unsqueeze(-1)
         self._total_mass = masses.sum(dim=1, keepdim=True)
 
-    def __call__(self, env, asset_cfg, support_body_names):
-        body_com = self._asset.data.body_com_pos_w  # per-link CoM positions, (num_envs, num_bodies, 3)
-        com_xy = (self._mass * body_com).sum(dim=1)[:, :2] / self._total_mass
-        support_xy = self._asset.data.body_pos_w[:, self._feet_ids, :2].mean(dim=1)
-        return torch.sum(torch.square(com_xy - support_xy), dim=1)
+    def __call__(self, env, mode: str) -> torch.Tensor:
+        com = (self._mass * self._asset.data.body_com_pos_w).sum(dim=1) / self._total_mass
+        cop = self._asset.data.body_pos_w[:, self._rear_ids, :].mean(dim=1)
+        cop[:, 2] = 0.0
+        pen = com - cop
+        length = pen.norm(dim=1).clamp(min=1e-6)
+        cos_theta = (pen[:, 2] / length).clamp(-1.0, 1.0)
+        if mode == "angle":
+            return torch.square(torch.acos(cos_theta))
+        if mode == "acc":
+            return (1.0 - torch.square(cos_theta)) / torch.square(length)
+        return pen[:, :2].norm(dim=1)  # "len_xy"
 
 
-class BipedalGaitReward(ManagerTermBase):
-    """Alternating-gait reward for the two rear feet (human-like walking).
+class ComCopObs(ManagerTermBase):
+    """Ground-truth CoM-CoP connection vector in the base frame (the paper's c-hat).
 
-    Rewards the rear feet being OUT of phase -- one in stance while the other swings --
-    using the same air/contact-time kernel as the quadruped trot reward in the stairs
-    task. Directly punishes pronking/hopping, where both feet leave and land together.
+    Stands in for the estimator network's output that TumblerNet feeds its actor:
+    force-weighted CoP over the four feet (tiny bias on the rear feet keeps the
+    vector defined in flight, as in their code) to the mass-weighted CoM, expressed
+    in the base frame.
     """
 
-    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+    def __init__(self, cfg: ObsTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self.std: float = cfg.params["std"]
-        self.max_err: float = cfg.params["max_err"]
-        self.velocity_threshold: float = cfg.params["velocity_threshold"]
-        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
-        self.asset = env.scene[cfg.params["asset_cfg"].name]
-        feet = self.contact_sensor.find_bodies(cfg.params["foot_names"])[0]
-        if len(feet) != 2:
-            raise ValueError(f"Expected exactly two rear feet, got body ids {feet}.")
-        self.foot_0, self.foot_1 = feet
+        self._asset = env.scene["robot"]
+        self._sensor = env.scene.sensors["contact_forces"]
+        self._feet_ids = self._asset.find_bodies(FEET_ORDER, preserve_order=True)[0]
+        self._sensor_feet_ids = self._sensor.find_bodies(FEET_ORDER, preserve_order=True)[0]
+        masses = self._asset.data.default_mass.to(env.device)
+        self._mass = masses.unsqueeze(-1)
+        self._total_mass = masses.sum(dim=1, keepdim=True)
+        # paper: + [0, 0, 1e-6, 1e-6] so the rear feet anchor the CoP at zero contact
+        self._eps = torch.tensor([0.0, 0.0, 1e-6, 1e-6], device=env.device)
 
-    def __call__(self, env, std, max_err, velocity_threshold, foot_names, asset_cfg, sensor_cfg):
-        at = self.contact_sensor.data.current_air_time
-        ct = self.contact_sensor.data.current_contact_time
-        se_0 = torch.clip(torch.square(at[:, self.foot_0] - ct[:, self.foot_1]), max=self.max_err**2)
-        se_1 = torch.clip(torch.square(ct[:, self.foot_0] - at[:, self.foot_1]), max=self.max_err**2)
-        reward = torch.exp(-(se_0 + se_1) / self.std)
-        cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
-        body_vel = torch.linalg.norm(self.asset.data.root_lin_vel_w[:, :2], dim=1)
-        return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
-
-
-def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Penalize BOTH rear feet being airborne at once (a flight phase = hopping, not walking)."""
-    contact_sensor = env.scene.sensors[sensor_cfg.name]
-    in_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
-    return (torch.sum(in_contact.int(), dim=1) == 0).float()
-
-
-def rear_feet_fore_aft_split(
-    env: ManagerBasedRLEnv,
-    threshold: float,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="R[LR]_foot"),
-) -> torch.Tensor:
-    """Penalize a fore-aft scissor stance of the rear feet (heading-frame split beyond a stride deadzone).
-
-    Without this, the policy cheats balance with a permanent lunge -- one rear foot far
-    ahead of the body, one far behind -- which is statically stable fore-aft instead of
-    the human-like feet-under-hips posture in the paper. Separation along the heading
-    direction up to ``threshold`` (a normal walking stride) is free; only the sustained
-    wide split is charged.
-    """
-    asset = env.scene[asset_cfg.name]
-    feet_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
-    diff = feet_xy[:, 0] - feet_xy[:, 1]
-    heading = asset.data.heading_w
-    dx = diff[:, 0] * torch.cos(heading) + diff[:, 1] * torch.sin(heading)
-    return torch.square(torch.clamp(torch.abs(dx) - threshold, min=0.0))
-
-
-class upright_curriculum(ManagerTermBase):
-    """Global posture curriculum: ramps the pitch/height targets as the population succeeds.
-
-    Tracks an EMA of the population's mean absolute pitch error. When the EMA drops
-    below ``err_threshold`` the level steps up by ``level_step`` (0 -> 1 overall) and
-    the EMA is bumped pessimistically so the next promotion waits for stable
-    performance at the NEW target. Returns a dict of ``{"level": ..., "ema_err": ...}``
-    so both appear in TensorBoard, as ``Curriculum/upright_level/level`` and
-    ``Curriculum/upright_level/ema_err``.
-
-    ``init_level`` seeds the level on construction -- pass 1.0 when resuming a run
-    whose curriculum already topped out (the level is not stored in checkpoints).
-    """
-
-    def __init__(self, cfg: CurrTerm, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self.level = float(cfg.params.get("init_level", 0.0))
-        self.ema_err = 1.0  # pessimistic init (rad)
-        self._apply(env)
-
-    def _apply(self, env: ManagerBasedRLEnv):
-        env.bipedal_pitch_target = PITCH_MIN + self.level * (PITCH_MAX - PITCH_MIN)
-        env.bipedal_height_target = HEIGHT_MIN + self.level * (HEIGHT_MAX - HEIGHT_MIN)
-
-    def __call__(
-        self,
-        env,
-        env_ids,
-        err_threshold: float = 0.15,
-        level_step: float = 0.05,
-        ema_alpha: float = 0.02,
-        init_level: float = 0.0,
-    ):
-        g = env.scene["robot"].data.projected_gravity_b
-        pitch = torch.atan2(-g[:, 0], -g[:, 2])  # 0 = flat, pi/2 = vertical
-        err = torch.abs(pitch - env.bipedal_pitch_target).mean().item()
-        self.ema_err = (1.0 - ema_alpha) * self.ema_err + ema_alpha * err
-        if self.ema_err < err_threshold and self.level < 1.0:
-            self.level = min(1.0, self.level + level_step)
-            self.ema_err += 0.2  # hysteresis: re-earn the threshold at the new target
-            self._apply(env)
-        return {"level": self.level, "ema_err": self.ema_err}
+    def __call__(self, env) -> torch.Tensor:
+        feet_w = self._asset.data.body_pos_w[:, self._feet_ids, :]
+        fz = self._sensor.data.net_forces_w[:, self._sensor_feet_ids, 2].clamp(min=0.0) + self._eps
+        cop_w = (feet_w * fz.unsqueeze(-1)).sum(dim=1) / fz.sum(dim=1, keepdim=True)
+        com_w = (self._mass * self._asset.data.body_com_pos_w).sum(dim=1) / self._total_mass
+        return quat_apply_inverse(self._asset.data.root_quat_w, com_w - cop_w)
 
 
 @configclass
 class BipedalRewardsCfg(RewardsCfg):
-    """Default velocity-task rewards + bipedal posture terms."""
+    """TumblerNet's released reward set (their shipped train_cfg_robot.py scales)."""
 
-    # -- task terms, frame-corrected for a pitched-up body (same pattern as the G1/H1
-    # humanoid configs): the default BODY-frame trackers break once the robot is
-    # vertical -- body x points at the sky, so tracking lin_vel_x would demand
-    # vertical motion.
+    # -- r1 tracking: 1.0 / 0.6, sigma^2 = 0.25 (std 0.5), gravity-aligned frame
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=2.0,
+        weight=1.0,
         params={"command_name": "base_velocity", "std": 0.5},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
-        weight=1.0,
+        weight=0.6,
         params={"command_name": "base_velocity", "std": 0.5},
     )
-    # world-frame regularizers (the body-frame defaults punish walking/turning when vertical)
-    lin_vel_z_l2 = RewTerm(func=lin_vel_z_world_l2, weight=-1.0)
+    # -- r3 smoothness: vertical bob and wobble (their lin_vel_z -2.0, ang_vel_xy -0.05)
+    lin_vel_z_l2 = RewTerm(func=lin_vel_z_world_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=ang_vel_xy_world_l2, weight=-0.05)
-
-    # the star reward: base attitude at the curriculum pitch target, roll ~ 0
-    upright = RewTerm(func=upright_pitch_exp, weight=3.0, params={"std": 0.25})
-    # stand tall at the curriculum height (prevents crouch-shuffling)
-    base_height = RewTerm(func=base_height_exp, weight=1.0, params={"std": 0.05})
-    # front feet must leave (and stay off) the ground
-    front_feet_contact = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-1.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["F[LR]_foot"]), "threshold": 1.0},
+    # -- r4 bipedal encouragement: upright trunk + standing height
+    orientation_up = RewTerm(func=gravity_xy_sq, weight=0.8)
+    orientation_z = RewTerm(func=gravity_z_sq, weight=-0.03)
+    base_height = RewTerm(func=mdp.base_height_l2, weight=-0.5, params={"target_height": 0.55})
+    # -- r4: front feet carry no load (continuous force, their fl+fr+f terms)
+    front_feet_force = RewTerm(
+        func=front_feet_force,
+        weight=-0.06,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["F[LR]_foot"])},
     )
-    # keep legs under the body (no splaying / flailing sideways)
-    joint_deviation_hips = RewTerm(
+    # -- r5 stability: VHIP + cart-table on the CoM-CoP pendulum
+    inv_pendulum = RewTerm(func=PendulumReward, weight=-0.1, params={"mode": "angle"})
+    inv_pendulum_acc = RewTerm(func=PendulumReward, weight=-0.0001, params={"mode": "acc"})
+    cart_table_len_xy = RewTerm(func=PendulumReward, weight=-0.1, params={"mode": "len_xy"})
+    # -- r3 motion: joint deviation from the default stance (their *_motion terms;
+    # rear hips strongest at -0.15, everything else -0.05)
+    joint_deviation_f_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"])},
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_hip_joint"])},
     )
-    # front legs hang in a natural tucked pose (paper ablation: without a pose
-    # regularizer the front legs cross and jitter). Raised from -0.05: at that weight
-    # the front legs still flailed rapidly in the air while walking.
-    joint_deviation_front_legs = RewTerm(
+    joint_deviation_r_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.25,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_thigh_joint", "F[LR]_calf_joint"])},
+        weight=-0.15,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_hip_joint"])},
     )
-    # damp front-leg thrashing directly (deviation alone allowed fast oscillation around
-    # the target pose)
-    front_joint_vel = RewTerm(
-        func=mdp.joint_vel_l2,
-        weight=-0.01,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot", joint_names=["F[LR]_hip_joint", "F[LR]_thigh_joint", "F[LR]_calf_joint"]
-            )
-        },
+    joint_deviation_thigh = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_thigh_joint"])},
     )
-    # human-like alternation of the rear feet (kills pronking)
-    gait = RewTerm(
-        func=BipedalGaitReward,
-        weight=1.0,
-        params={
-            "std": 0.1,
-            "max_err": 0.2,
-            "velocity_threshold": 0.3,
-            "foot_names": ["R[LR]_foot"],
-            "asset_cfg": SceneEntityCfg("robot"),
-            "sensor_cfg": SceneEntityCfg("contact_forces"),
-        },
-    )
-    # walking keeps one foot on the ground: penalize flight phases outright
-    # no fencer's-lunge stance: rear feet stay near each other fore-aft, as in the paper
-    rear_feet_split = RewTerm(
-        func=rear_feet_fore_aft_split,
-        weight=-10.0,
-        params={"threshold": 0.15, "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot")},
-    )
-    rear_double_air = RewTerm(
-        func=rear_feet_double_air,
-        weight=-1.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
-    )
-    # keep the CoM over the rear-feet support (TumblerNet's core stability criterion)
-    com_over_support = RewTerm(
-        func=ComOverSupportReward,
-        weight=-2.0,
-        params={"asset_cfg": SceneEntityCfg("robot"), "support_body_names": ["R[LR]_foot"]},
-    )
-    # crisp rear footholds (no skating)
-    feet_slide = RewTerm(
-        func=mdp.feet_slide,
-        weight=-0.1,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="R[LR]_foot"),
-            "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot"),
-        },
+    joint_deviation_calf = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_calf_joint"])},
     )
 
 
 @configclass
 class BipedalCurriculumCfg:
-    """Posture curriculum only (flat ground -> no terrain curriculum)."""
+    """No curriculum: the paper trains directly to the vertical posture."""
 
-    upright_level = CurrTerm(
-        func=upright_curriculum,
-        params={"err_threshold": 0.15, "level_step": 0.05, "ema_alpha": 0.02, "init_level": 0.0},
-    )
+    pass
 
 
 @configclass
@@ -345,34 +241,41 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # --- terrain: flat plane; balancing is the whole challenge ---
+        # --- terrain: flat plane (paper trains on flat ground only) ---
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
 
-        # --- actions: bigger excursions than the quadruped tasks (rearing up needs
-        # the rear hips/thighs far from the default stance) ---
-        self.actions.joint_pos.scale = 0.5
+        # --- episode / control: paper values (22 s; action_scale 0.25, Kp 30, Kd 0.8) ---
+        self.episode_length_s = 22.0
+        self.actions.joint_pos.scale = 0.25
+        self.scene.robot.actuators["base_legs"].stiffness = 30.0
+        self.scene.robot.actuators["base_legs"].damping = 0.8
 
-        # --- rewards ---
-        # re-assert the task weights: the parent (quadruped) post_init overrides them
-        # after our class-body defaults are constructed
-        self.rewards.track_lin_vel_xy_exp.weight = 2.0
-        self.rewards.track_ang_vel_z_exp.weight = 1.0
-        self.rewards.flat_orientation_l2.weight = 0.0  # replaced by the upright target
-        # rear feet must actually step: biped air-time reward on the rear pair
+        # --- observations: the paper's actor also sees the CoM-CoP vector (c-hat) ---
+        self.observations.policy.com_cop = ObsTerm(func=ComCopObs)
+
+        # --- rewards: re-assert tracking weights (parent post_init sets quadruped
+        # values 1.5/0.75 after our class-body defaults), then the remaining paper
+        # scales on inherited terms ---
+        self.rewards.track_lin_vel_xy_exp.weight = 1.0
+        self.rewards.track_ang_vel_z_exp.weight = 0.6
+        self.rewards.action_rate_l2.weight = -0.02
+        self.rewards.dof_torques_l2.weight = 0.0  # paper: torques = -0.
+        self.rewards.dof_acc_l2.weight = 0.0  # paper: dof_acc = -0.
+        self.rewards.flat_orientation_l2.weight = 0.0  # replaced by orientation_up/_z
+        # paper feet_air_time = 1.0, threshold 0.5 s, all feet (legged_gym first-contact style)
         self.rewards.feet_air_time = RewTerm(
-            func=mdp.feet_air_time_positive_biped,
-            weight=0.5,
+            func=mdp.feet_air_time,
+            weight=1.0,
             params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
                 "command_name": "base_velocity",
-                "threshold": 0.4,
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"]),
+                "threshold": 0.5,
             },
         )
-        # nothing but the rear feet may rest on the ground (also kills the
-        # sitting-dog pose: pitched-up body resting on the rear calves)
+        # paper collision = -1.0 on thigh + calf contacts
         self.rewards.undesired_contacts = RewTerm(
             func=mdp.undesired_contacts,
             weight=-1.0,
@@ -382,18 +285,30 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             },
         )
 
-        # --- commands: forward/backward + turn, no lateral, some pure standing ---
-        self.commands.base_velocity.heading_command = False
-        self.commands.base_velocity.rel_heading_envs = 0.0
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.4, 0.8)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.8, 0.8)
-        self.commands.base_velocity.rel_standing_envs = 0.2
+        # --- commands: the base velocity-task defaults ARE the paper's ranges
+        # (lin x/y in [-1, 1], yaw in [-1, 1], heading command mode, resample 10 s) ---
 
-        # --- terminations: falling flat ends the episode (base contact is inherited) ---
-        self.terminations.base_height = DoneTerm(
-            func=mdp.root_height_below_minimum, params={"minimum_height": 0.12}
+        # --- events: paper domain randomization ---
+        self.events.physics_material.params["static_friction_range"] = (0.2, 1.25)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.2, 1.25)
+        self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 2.0)
+        self.events.base_com = EventTerm(
+            func=mdp.randomize_rigid_body_com,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+                "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+            },
         )
+        self.events.push_robot = EventTerm(
+            func=mdp.push_by_setting_velocity,
+            mode="interval",
+            interval_range_s=(10.0, 10.0),
+            params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
+        )
+
+        # --- terminations: paper terminates on base/trunk/hip ground contact ---
+        self.terminations.base_contact.params["sensor_cfg"].body_names = ["base", ".*_hip"]
 
 
 @configclass
@@ -405,11 +320,11 @@ class UnitreeGo2BipedalEnvCfg_PLAY(UnitreeGo2BipedalEnvCfg):
         self.scene.num_envs = 10
         self.scene.env_spacing = 2.5
 
-        # no curriculum at play time -> rewards fall back to the final vertical target
-        self.curriculum.upright_level = None
-
         # scripted demo: walk forward at a steady bipedal pace for the whole episode
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
         self.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.resampling_time_range = (100.0, 100.0)

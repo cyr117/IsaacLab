@@ -62,6 +62,6 @@ class UnitreeGo2BipedalPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # bipedal balance is a long curriculum; give it room
-        self.max_iterations = 8000
+        # paper (TumblerNet shipped config): 10000 policy updates
+        self.max_iterations = 10000
         self.experiment_name = "unitree_go2_bipedal"
