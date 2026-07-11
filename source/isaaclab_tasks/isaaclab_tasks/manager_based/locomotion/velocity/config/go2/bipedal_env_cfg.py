@@ -300,9 +300,12 @@ class BipedalRewardsCfg(RewardsCfg):
         weight=-0.15,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_hip_joint"])},
     )
+    # reference weight is -0.15, doubled here: in Isaac Lab the policy holds ~2x the
+    # reference's rear-hip abduction (legs splayed outward for roll stability), and
+    # the reference curve shows this term stops improving after ~iter 2000 on its own
     joint_deviation_r_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.15,
+        weight=-0.3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_hip_joint"])},
     )
     joint_deviation_thigh = RewTerm(
