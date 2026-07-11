@@ -292,6 +292,30 @@ class BipedalGaitReward(ManagerTermBase):
         return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
 
 
+def rear_feet_fore_aft_split(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="R[LR]_foot"),
+) -> torch.Tensor:
+    """Penalize a fore-aft scissor stance of the rear feet (EXTENSION, not in the paper).
+
+    Without this, the policy cheats balance with a permanent lunge -- one rear foot
+    far ahead of the body, one far behind -- which is statically stable fore-aft
+    instead of the paper's feet-under-hips posture. Separation along the TRAVEL
+    (belly) direction up to ``threshold`` (a normal walking stride) is free; only the
+    sustained wide split is charged.
+    """
+    asset = env.scene[asset_cfg.name]
+    feet_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    diff = feet_xy[:, 0] - feet_xy[:, 1]
+    belly = quat_apply(
+        asset.data.root_quat_w, torch.tensor([0.0, 0.0, -1.0], device=env.device).expand(env.num_envs, 3)
+    )
+    heading = torch.atan2(belly[:, 1], belly[:, 0])
+    dx = diff[:, 0] * torch.cos(heading) + diff[:, 1] * torch.sin(heading)
+    return torch.square(torch.clamp(torch.abs(dx) - threshold, min=0.0))
+
+
 def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize BOTH rear feet airborne at once (EXTENSION, not in the paper).
 
@@ -379,6 +403,12 @@ class BipedalRewardsCfg(RewardsCfg):
         func=rear_feet_double_air,
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
+    )
+    # no fencer's-lunge stance: rear feet stay near each other fore-aft, as in the paper
+    rear_feet_split = RewTerm(
+        func=rear_feet_fore_aft_split,
+        weight=-10.0,
+        params={"threshold": 0.15, "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot")},
     )
 
 
