@@ -443,8 +443,12 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
         )
 
-        # --- terminations: reference terminates on base/hip/THIGH ground contact ---
-        self.terminations.base_contact.params["sensor_cfg"].body_names = ["base", ".*_hip", ".*_thigh"]
+        # --- terminations: base/hip ground contact (as in the paper authors' code).
+        # The friend's code also terminates on thigh contact, but in Isaac Lab's Go2
+        # USD the thigh collision mesh touches the ground when the default deep
+        # crouch settles (probe: 58% of spawns, base/hip 0%), so thigh termination
+        # kills most episodes at spawn. Thigh contact stays penalized (-1.0). ---
+        self.terminations.base_contact.params["sensor_cfg"].body_names = ["base", ".*_hip"]
 
 
 @configclass
