@@ -338,12 +338,19 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
 
-        # --- robot: reference default stance (deep symmetric crouch) and start pose ---
-        self.scene.robot.init_state.pos = (0.0, 0.0, 0.5)
+        # --- robot: PAPER AUTHORS' default stance (quadruped standing), not the
+        # friend's deep crouch (thigh 0.9 / calf -1.8 / z 0.5). In Isaac Lab's Go2
+        # USD the deep crouch settles on calves + thighs (spawn probe: thigh contact
+        # 58%), which both kills episodes under thigh termination and makes the
+        # sit/tripod postures comfortable local optima (friendport2 plateaued in a
+        # front-leg-crutch tripod, ~60 N on front feet). The shallower paper stance
+        # keeps thighs clear of the ground so thigh termination can do its job. ---
+        self.scene.robot.init_state.pos = (0.0, 0.0, 0.34)
         self.scene.robot.init_state.joint_pos = {
             ".*_hip_joint": 0.0,
-            ".*_thigh_joint": 0.9,
-            ".*_calf_joint": -1.8,
+            "F[LR]_thigh_joint": 0.8,
+            "R[LR]_thigh_joint": 1.0,
+            ".*_calf_joint": -1.5,
         }
 
         # --- episode / control: 22 s; action_scale 0.25, Kp 30, Kd 0.8 ---
@@ -443,12 +450,10 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
         )
 
-        # --- terminations: base/hip ground contact (as in the paper authors' code).
-        # The friend's code also terminates on thigh contact, but in Isaac Lab's Go2
-        # USD the thigh collision mesh touches the ground when the default deep
-        # crouch settles (probe: 58% of spawns, base/hip 0%), so thigh termination
-        # kills most episodes at spawn. Thigh contact stays penalized (-1.0). ---
-        self.terminations.base_contact.params["sensor_cfg"].body_names = ["base", ".*_hip"]
+        # --- terminations: base/hip/thigh ground contact (friend's setting; the
+        # thigh rule is the anti-sit/anti-kneel pressure -- viable here because the
+        # paper stance above keeps thighs off the ground at spawn) ---
+        self.terminations.base_contact.params["sensor_cfg"].body_names = ["base", ".*_hip", ".*_thigh"]
 
 
 @configclass
