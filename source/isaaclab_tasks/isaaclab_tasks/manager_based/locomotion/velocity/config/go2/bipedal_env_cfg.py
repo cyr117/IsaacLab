@@ -404,11 +404,13 @@ class BipedalRewardsCfg(RewardsCfg):
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
     )
-    # no fencer's-lunge stance: rear feet stay near each other fore-aft, as in the paper
+    # no fencer's-lunge stance: rear feet stay side-by-side as in the paper. Deadzone
+    # 0.05 m: a 0.15 m deadzone let a permanent 15 cm lunge ride for free (verified
+    # in play); 5 cm keeps stance feet aligned while steps pass through transiently.
     rear_feet_split = RewTerm(
         func=rear_feet_fore_aft_split,
         weight=-10.0,
-        params={"threshold": 0.15, "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot")},
+        params={"threshold": 0.05, "asset_cfg": SceneEntityCfg("robot", body_names="R[LR]_foot")},
     )
 
 
