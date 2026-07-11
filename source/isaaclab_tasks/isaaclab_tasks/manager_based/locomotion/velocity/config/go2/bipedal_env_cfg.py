@@ -349,7 +349,10 @@ class BipedalRewardsCfg(RewardsCfg):
     # -- bipedal encouragement: upright trunk + standing height (target 0.6)
     orientation_up = RewTerm(func=gravity_xy_sq, weight=0.8)
     orientation_z = RewTerm(func=gravity_z_sq, weight=-0.03)
-    base_height = RewTerm(func=mdp.base_height_l2, weight=-0.5, params={"target_height": 0.6})
+    # reference target is 0.6, lowered to 0.5: a 0.6 target rewards standing with the
+    # rear legs fully extended (trunk as tall as possible), fighting the paper's
+    # flexed-knee stance whose trunk height is ~0.45-0.5
+    base_height = RewTerm(func=mdp.base_height_l2, weight=-0.5, params={"target_height": 0.5})
     # -- front feet carry no load (continuous force, their fl+fr+f terms)
     front_feet_force = RewTerm(
         func=front_feet_force,
@@ -378,10 +381,19 @@ class BipedalRewardsCfg(RewardsCfg):
         weight=-0.3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_hip_joint"])},
     )
-    joint_deviation_thigh = RewTerm(
+    joint_deviation_f_thigh = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.05,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_thigh_joint"])},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_thigh_joint"])},
+    )
+    # rear thighs 10x the reference (-0.05): the policy otherwise stands with the
+    # rear legs fully extended (thigh in line with the trunk, ~180 deg), feet trailing
+    # behind the CoM. Strong pull toward the flexed default (1.0 rad) reproduces the
+    # paper's bent-knee stance (~140 deg trunk-thigh angle, feet under the body).
+    joint_deviation_r_thigh = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_thigh_joint"])},
     )
     joint_deviation_calf = RewTerm(
         func=mdp.joint_deviation_l1,
