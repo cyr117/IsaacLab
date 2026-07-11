@@ -359,7 +359,10 @@ class BipedalRewardsCfg(RewardsCfg):
     # -- stability: VHIP + cart-table on the CoM-CoP pendulum
     inv_pendulum = RewTerm(func=PendulumReward, weight=-0.1, params={"mode": "angle"})
     inv_pendulum_acc = RewTerm(func=PendulumReward, weight=-0.0001, params={"mode": "acc"})
-    cart_table_len_xy = RewTerm(func=PendulumReward, weight=-0.1, params={"mode": "len_xy"})
+    # reference weight is -0.1, x5 here: the CoM-over-CoP offset is the paper's own
+    # "feet directly under the body" measure (its photos show the contact point under
+    # the trunk); at -0.1 the policy trailed its feet behind the body
+    cart_table_len_xy = RewTerm(func=PendulumReward, weight=-0.5, params={"mode": "len_xy"})
     # -- joint deviation from the default stance (their *_motion terms: BOTH hip
     # pairs -0.15, thighs/calves -0.05)
     joint_deviation_f_hip = RewTerm(
@@ -477,12 +480,22 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
                 "threshold": 0.5,
             },
         )
-        # reference collision = -1.0 on thigh + calf contacts (force threshold 0.1 N)
+        # reference collision = -1.0 on thigh + calf contacts (force threshold 0.1 N);
+        # calves split out at -5.0: at -1.0 the policy knee-walks with its shins on
+        # the ground (user-reported; the paper robot keeps shins clear, feet only)
         self.rewards.undesired_contacts = RewTerm(
             func=mdp.undesired_contacts,
             weight=-1.0,
             params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]),
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh"]),
+                "threshold": 0.1,
+            },
+        )
+        self.rewards.calf_contact = RewTerm(
+            func=mdp.undesired_contacts,
+            weight=-5.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_calf"]),
                 "threshold": 0.1,
             },
         )
