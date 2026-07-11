@@ -260,6 +260,49 @@ class ComCopObs(ManagerTermBase):
         return quat_apply_inverse(self._asset.data.root_quat_w, com_w - cop_w)
 
 
+class BipedalGaitReward(ManagerTermBase):
+    """Alternating-gait reward for the two rear feet (EXTENSION, not in the paper).
+
+    The paper's reward set does not discriminate between hopping and walking: a
+    two-footed forward hop earns tracking and air-time just like stepping. This term
+    rewards the rear feet being OUT of phase -- one in stance while the other swings
+    -- which produced human-like alternation in earlier runs of this task.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.std: float = cfg.params["std"]
+        self.max_err: float = cfg.params["max_err"]
+        self.velocity_threshold: float = cfg.params["velocity_threshold"]
+        self.contact_sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self.asset = env.scene[cfg.params["asset_cfg"].name]
+        feet = self.contact_sensor.find_bodies(cfg.params["foot_names"])[0]
+        if len(feet) != 2:
+            raise ValueError(f"Expected exactly two rear feet, got body ids {feet}.")
+        self.foot_0, self.foot_1 = feet
+
+    def __call__(self, env, std, max_err, velocity_threshold, foot_names, asset_cfg, sensor_cfg):
+        at = self.contact_sensor.data.current_air_time
+        ct = self.contact_sensor.data.current_contact_time
+        se_0 = torch.clip(torch.square(at[:, self.foot_0] - ct[:, self.foot_1]), max=self.max_err**2)
+        se_1 = torch.clip(torch.square(ct[:, self.foot_0] - at[:, self.foot_1]), max=self.max_err**2)
+        reward = torch.exp(-(se_0 + se_1) / self.std)
+        cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
+        body_vel = torch.linalg.norm(self.asset.data.root_lin_vel_w[:, :2], dim=1)
+        return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
+
+
+def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Penalize BOTH rear feet airborne at once (EXTENSION, not in the paper).
+
+    A flight phase = hopping; walking keeps one foot planted. Together with the gait
+    term this eliminated pronking in earlier runs of this task.
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    in_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    return (torch.sum(in_contact.int(), dim=1) == 0).float()
+
+
 @configclass
 class BipedalRewardsCfg(RewardsCfg):
     """The reference code's reward set, term for term (weights re-asserted in
@@ -317,6 +360,25 @@ class BipedalRewardsCfg(RewardsCfg):
         func=mdp.joint_deviation_l1,
         weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_calf_joint"])},
+    )
+    # -- EXTENSIONS beyond the paper (user requirement: human-like alternating walk,
+    # no hopping -- the paper's set does not discriminate between the two)
+    gait = RewTerm(
+        func=BipedalGaitReward,
+        weight=1.0,
+        params={
+            "std": 0.1,
+            "max_err": 0.2,
+            "velocity_threshold": 0.3,
+            "foot_names": ["R[LR]_foot"],
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+        },
+    )
+    rear_double_air = RewTerm(
+        func=rear_feet_double_air,
+        weight=-1.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
     )
 
 
