@@ -340,6 +340,31 @@ def rear_feet_fore_aft_split(
     return torch.square(torch.clamp(torch.abs(dx) - threshold, min=0.0))
 
 
+def rear_gait_symmetry(
+    env: ManagerBasedRLEnv,
+    std: float,
+    velocity_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward EQUAL step timing across the two rear feet (EXTENSION, not in the paper).
+
+    The anti-phase gait term does not require the legs to share the work: a limp --
+    one leg in long support stance while the other takes quick steps -- is perfectly
+    anti-phase. This term matches the two feet's last air times and last contact
+    times, so both legs must step at the same (fast) pace, as in the paper's videos.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    la = sensor.data.last_air_time[:, sensor_cfg.body_ids]
+    lc = sensor.data.last_contact_time[:, sensor_cfg.body_ids]
+    err = torch.square(la[:, 0] - la[:, 1]) + torch.square(lc[:, 0] - lc[:, 1])
+    reward = torch.exp(-err / std**2)
+    asset = env.scene[asset_cfg.name]
+    cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
+    body_vel = torch.linalg.norm(asset.data.root_lin_vel_w[:, :2], dim=1)
+    return torch.where(torch.logical_or(cmd > 0.0, body_vel > velocity_threshold), reward, 0.0)
+
+
 def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize BOTH rear feet airborne at once (EXTENSION, not in the paper).
 
@@ -446,6 +471,23 @@ class BipedalRewardsCfg(RewardsCfg):
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
     )
+    # both rear legs step at the same pace (no support-leg limp)
+    gait_symmetry = RewTerm(
+        func=rear_gait_symmetry,
+        weight=0.5,
+        params={
+            "std": 0.15,
+            "velocity_threshold": 0.3,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"]),
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    # damp front-leg sweeping in the air (position deviation alone permits fast swings)
+    front_joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.002,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_.*_joint"])},
+    )
     # no fencer's-lunge stance: rear feet stay side-by-side as in the paper. Deadzone
     # 0.05 m: a 0.15 m deadzone let a permanent 15 cm lunge ride for free (verified
     # in play); 5 cm keeps stance feet aligned while steps pass through transiently.
@@ -509,14 +551,16 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         self.rewards.dof_torques_l2.weight = 0.0
         self.rewards.dof_acc_l2.weight = 0.0
         self.rewards.flat_orientation_l2.weight = 0.0  # replaced by orientation_up/_z
-        # reference feet_air_time = 0.5, threshold 0.5 s, all feet
+        # reference feet_air_time = 0.5 weight; threshold lowered 0.5 -> 0.3 s: the
+        # term pays (air_time - threshold) on touchdown, so a 0.5 s threshold TAXES
+        # the paper's rapid stepping and rewards a slow support-leg pattern instead
         self.rewards.feet_air_time = RewTerm(
             func=mdp.feet_air_time,
             weight=0.5,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
                 "command_name": "base_velocity",
-                "threshold": 0.5,
+                "threshold": 0.3,
             },
         )
         # reference collision = -1.0 on thigh + calf contacts (force threshold 0.1 N);
