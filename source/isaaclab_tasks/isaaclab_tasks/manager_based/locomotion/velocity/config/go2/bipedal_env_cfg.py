@@ -308,8 +308,12 @@ def rear_thigh_standing_flexion(
     """
     asset = env.scene[asset_cfg.name]
     gate = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
-    dev = torch.sum(torch.abs(asset.data.joint_pos[:, asset_cfg.joint_ids] - target), dim=1)
-    return gate * dev
+    dev = torch.mean(torch.abs(asset.data.joint_pos[:, asset_cfg.joint_ids] - target), dim=1)
+    # POSITIVE bonus, linear falloff: a gated PENALTY taxes standing itself, and the
+    # policy responds by not standing at all (scratch4: orientation collapsed to
+    # 0.08). As a bonus, standing is never punished -- upright + correct bend earns
+    # up to +1 extra, upright + straight legs earns ~0 with a steady gradient.
+    return gate * torch.clamp(1.0 - dev / 1.5, min=0.0)
 
 
 def rear_feet_fore_aft_split(
@@ -415,7 +419,7 @@ class BipedalRewardsCfg(RewardsCfg):
     # from the quadruped default CANNOT express it (see rear_thigh_standing_flexion)
     rear_thigh_flexion = RewTerm(
         func=rear_thigh_standing_flexion,
-        weight=-0.5,
+        weight=0.5,
         params={"target": 2.4, "asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_thigh_joint"])},
     )
     joint_deviation_calf = RewTerm(
