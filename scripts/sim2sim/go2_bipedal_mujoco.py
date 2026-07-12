@@ -31,6 +31,11 @@ parser.add_argument(
     "--init", type=str, default="quadruped", choices=["quadruped", "bipedal"],
     help="start pose: quadruped stance (tests stand-up too) or near-bipedal (tests balance/walk only)",
 )
+parser.add_argument(
+    "--dc-motor", action="store_true",
+    help="apply the DC-motor torque fade (checkpoints BEFORE robust1 trained with it; "
+    "robust1+ trained with DelayedPD = flat 23.5 N*m limit, the default here)",
+)
 args = parser.parse_args()
 
 # -- locate exported policy + metadata
@@ -72,6 +77,8 @@ SAT_EFFORT, EFFORT_LIM, VEL_LIM = 23.5, 23.5, 30.0
 
 
 def dc_motor_clip(tau, qd):
+    if not args.dc_motor:  # flat limit: matches DelayedPD training plant (robust1+)
+        return np.clip(tau, -EFFORT_LIM, EFFORT_LIM)
     max_tau = np.clip(SAT_EFFORT * (1.0 - qd / VEL_LIM), 0.0, EFFORT_LIM)
     min_tau = np.clip(SAT_EFFORT * (-1.0 - qd / VEL_LIM), -EFFORT_LIM, 0.0)
     return np.clip(tau, min_tau, max_tau)
