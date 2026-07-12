@@ -677,8 +677,10 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         # --- events: reference domain randomization ---
         self.events.physics_material.params["static_friction_range"] = (0.2, 1.25)
         self.events.physics_material.params["dynamic_friction_range"] = (0.2, 1.25)
-        # ROBUSTNESS (sim2sim): varied contact response + per-link inertia spread
-        self.events.physics_material.params["restitution_range"] = (0.0, 0.3)
+        # ROBUSTNESS (sim2sim): varied contact response + per-link inertia spread.
+        # Restitution capped at 0.1: 0.3 on the stiff plant made landings bouncy
+        # enough to spike observations and blow up PPO's action std (repeated NaN).
+        self.events.physics_material.params["restitution_range"] = (0.0, 0.1)
         self.events.link_mass = EventTerm(
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
