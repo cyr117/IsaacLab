@@ -365,6 +365,30 @@ def rear_gait_symmetry(
     return torch.where(torch.logical_or(cmd > 0.0, body_vel > velocity_threshold), reward, 0.0)
 
 
+def rear_feet_phase_cap(
+    env: ManagerBasedRLEnv,
+    max_time: float,
+    velocity_threshold: float,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize a rear foot camping in stance OR swing beyond ``max_time`` (EXTENSION).
+
+    The paper's gait is a rapid sequence of small forward steps. Without a cadence
+    bound the policy balances with a long-stance support leg and occasional large
+    corrective steps. Charging any stance/swing phase beyond ``max_time`` (while
+    moving) forces both feet into the paper's quick, regular, small-step rhythm.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    ct = sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    at = sensor.data.current_air_time[:, sensor_cfg.body_ids]
+    over = (ct - max_time).clamp(min=0.0).sum(dim=1) + (at - max_time).clamp(min=0.0).sum(dim=1)
+    asset = env.scene[asset_cfg.name]
+    cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
+    body_vel = torch.linalg.norm(asset.data.root_lin_vel_w[:, :2], dim=1)
+    return torch.where(torch.logical_or(cmd > 0.0, body_vel > velocity_threshold), over, torch.zeros_like(over))
+
+
 def rear_feet_double_air(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize BOTH rear feet airborne at once (EXTENSION, not in the paper).
 
@@ -409,7 +433,10 @@ class BipedalRewardsCfg(RewardsCfg):
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["F[LR]_foot"])},
     )
     # -- stability: VHIP + cart-table on the CoM-CoP pendulum
-    inv_pendulum = RewTerm(func=PendulumReward, weight=-0.1, params={"mode": "angle"})
+    # reference weight is -0.1, x2 here: with the looser setting the policy lets the
+    # CoM drift and rescues balance with large corrective steps instead of the
+    # paper's tight small-step gait
+    inv_pendulum = RewTerm(func=PendulumReward, weight=-0.2, params={"mode": "angle"})
     inv_pendulum_acc = RewTerm(func=PendulumReward, weight=-0.0001, params={"mode": "acc"})
     # reference weight is -0.1, x5 here: the CoM-over-CoP offset is the paper's own
     # "feet directly under the body" measure (its photos show the contact point under
@@ -470,6 +497,17 @@ class BipedalRewardsCfg(RewardsCfg):
         func=rear_feet_double_air,
         weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"])},
+    )
+    # rapid small-step cadence: no rear foot may camp in stance or swing > 0.4 s
+    phase_cap = RewTerm(
+        func=rear_feet_phase_cap,
+        weight=-2.0,
+        params={
+            "max_time": 0.4,
+            "velocity_threshold": 0.3,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["R[LR]_foot"]),
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
     # both rear legs step at the same pace (no support-leg limp)
     gait_symmetry = RewTerm(
