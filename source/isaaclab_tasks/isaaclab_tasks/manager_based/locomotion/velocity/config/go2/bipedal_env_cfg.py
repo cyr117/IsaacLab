@@ -574,6 +574,14 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
 
+        # ROBUSTNESS (sim2sim): stiffen PhysX toward MuJoCo's contact response. The
+        # soft defaults (4 position iterations, depenetration capped at 1 m/s) absorb
+        # energy during the explosive stand-up; MuJoCo's stiffer solver returns it as
+        # rotation and the policy over-rotates. Train on the stiff plant instead.
+        self.scene.robot.spawn.rigid_props.max_depenetration_velocity = 10.0
+        self.scene.robot.spawn.articulation_props.solver_position_iteration_count = 8
+        self.scene.robot.spawn.articulation_props.solver_velocity_iteration_count = 1
+
         # --- robot: PAPER AUTHORS' default stance (quadruped standing), not the
         # friend's deep crouch (thigh 0.9 / calf -1.8 / z 0.5). In Isaac Lab's Go2
         # USD the deep crouch settles on calves + thighs (spawn probe: thigh contact
@@ -669,6 +677,17 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         # --- events: reference domain randomization ---
         self.events.physics_material.params["static_friction_range"] = (0.2, 1.25)
         self.events.physics_material.params["dynamic_friction_range"] = (0.2, 1.25)
+        # ROBUSTNESS (sim2sim): varied contact response + per-link inertia spread
+        self.events.physics_material.params["restitution_range"] = (0.0, 0.3)
+        self.events.link_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "mass_distribution_params": (0.9, 1.1),
+                "operation": "scale",
+            },
+        )
         self.events.add_base_mass.params["mass_distribution_params"] = (-2.0, 2.0)
         self.events.base_com = EventTerm(
             func=mdp.randomize_rigid_body_com,
