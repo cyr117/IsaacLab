@@ -46,6 +46,7 @@ import math
 import torch
 from collections.abc import Sequence
 
+from isaaclab.actuators import DelayedPDActuatorCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.commands import UniformVelocityCommand
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -290,6 +291,22 @@ class BipedalGaitReward(ManagerTermBase):
         cmd = torch.norm(env.command_manager.get_command("base_velocity"), dim=1)
         body_vel = torch.linalg.norm(self.asset.data.root_lin_vel_w[:, :2], dim=1)
         return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
+
+
+def randomize_motor_offsets(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+    offset_range: tuple[float, float],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Per-joint encoder/zero offset (reference code's Motor_Offset, +-0.02 rad).
+
+    Shifts each env's default joint positions by a constant random offset: the action
+    center, the joint-position observation, and the deviation rewards all move
+    together, exactly like a mis-calibrated encoder zero on the real robot."""
+    asset = env.scene[asset_cfg.name]
+    offsets = torch.empty_like(asset.data.default_joint_pos).uniform_(offset_range[0], offset_range[1])
+    asset.data.default_joint_pos += offsets
 
 
 def rear_thigh_standing_flexion(
@@ -575,8 +592,18 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
         # --- episode / control: 22 s; action_scale 0.25, Kp 30, Kd 0.8 ---
         self.episode_length_s = 22.0
         self.actions.joint_pos.scale = 0.25
-        self.scene.robot.actuators["base_legs"].stiffness = 30.0
-        self.scene.robot.actuators["base_legs"].damping = 0.8
+        # ROBUSTNESS (sim2sim/sim2real): PD actuator with a randomized command delay
+        # of 0-4 physics steps (0-20 ms; the reference code lags by 2 steps = 10 ms).
+        # Replaces the DC-motor model; its 23.5 N*m cap is kept as a flat limit.
+        self.scene.robot.actuators["base_legs"] = DelayedPDActuatorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
+            effort_limit=23.5,
+            velocity_limit=30.0,
+            stiffness=30.0,
+            damping=0.8,
+            min_delay=0,
+            max_delay=4,
+        )
 
         # --- observations: the actor also sees the CoM-CoP vector (c-hat) ---
         self.observations.policy.com_cop = ObsTerm(func=ComCopObs)
@@ -649,6 +676,25 @@ class UnitreeGo2BipedalEnvCfg(UnitreeGo2RoughEnvCfg):
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="base"),
                 "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (0.0, 0.0)},
+            },
+        )
+        # ROBUSTNESS: per-joint encoder-zero offset (+-0.02 rad, reference code) and
+        # joint friction/armature randomization (targets the plant-response gap
+        # observed in MuJoCo sim2sim)
+        self.events.motor_offset = EventTerm(
+            func=randomize_motor_offsets,
+            mode="startup",
+            params={"offset_range": (-0.02, 0.02)},
+        )
+        self.events.joint_params = EventTerm(
+            func=mdp.randomize_joint_parameters,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "friction_distribution_params": (0.0, 0.03),
+                "armature_distribution_params": (0.0, 0.02),
+                "operation": "abs",
+                "distribution": "uniform",
             },
         )
         # motor strength: PD gains scaled by U(0.9, 1.1) per joint
