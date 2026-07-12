@@ -292,6 +292,26 @@ class BipedalGaitReward(ManagerTermBase):
         return torch.where(torch.logical_or(cmd > 0.0, body_vel > self.velocity_threshold), reward, 0.0)
 
 
+def rear_thigh_standing_flexion(
+    env: ManagerBasedRLEnv,
+    target: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["R[LR]_thigh_joint"]),
+) -> torch.Tensor:
+    """Pull the rear thighs toward the STANDING flexion angle, gated by uprightness.
+
+    Joint deviation from the quadruped default keeps the leg aligned with the TRUNK
+    frame -- when the trunk pitches up ~90 deg that reads as a straight ~180 deg
+    trunk-thigh line, not the paper's ~140 deg bend. The paper posture needs
+    q_thigh ~ default + pitch (~2.4 rad): knees behind the trunk line, calves down to
+    feet under the body. Gated by g_xy^2 (0 in quadruped stance, 1 when vertical) so
+    it never interferes with the stand-up itself.
+    """
+    asset = env.scene[asset_cfg.name]
+    gate = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    dev = torch.sum(torch.abs(asset.data.joint_pos[:, asset_cfg.joint_ids] - target), dim=1)
+    return gate * dev
+
+
 def rear_feet_fore_aft_split(
     env: ManagerBasedRLEnv,
     threshold: float,
@@ -386,14 +406,17 @@ class BipedalRewardsCfg(RewardsCfg):
         weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["F[LR]_thigh_joint"])},
     )
-    # rear thighs 10x the reference (-0.05): the policy otherwise stands with the
-    # rear legs fully extended (thigh in line with the trunk, ~180 deg), feet trailing
-    # behind the CoM. Strong pull toward the flexed default (1.0 rad) reproduces the
-    # paper's bent-knee stance (~140 deg trunk-thigh angle, feet under the body).
     joint_deviation_r_thigh = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.5,
+        weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_thigh_joint"])},
+    )
+    # paper's bent-knee standing posture (~140 deg trunk-thigh): body-frame deviation
+    # from the quadruped default CANNOT express it (see rear_thigh_standing_flexion)
+    rear_thigh_flexion = RewTerm(
+        func=rear_thigh_standing_flexion,
+        weight=-0.5,
+        params={"target": 2.4, "asset_cfg": SceneEntityCfg("robot", joint_names=["R[LR]_thigh_joint"])},
     )
     joint_deviation_calf = RewTerm(
         func=mdp.joint_deviation_l1,
